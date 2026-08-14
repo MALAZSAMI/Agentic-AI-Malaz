@@ -1,0 +1,44 @@
+# Decision Memo: Prompt Engineering Strategy for Support Email Triage
+
+## 1. Executive Summary & Recommendation
+We recommend adopting **Technique E (Schema-Constrained Generation)** for the automated triage agent. 
+
+Technique E achieves the optimal balance of deterministic schema compliance, field extraction accuracy, low latency, and token efficiency while successfully passing all safety guardrails.
+
+---
+
+## 2. Benchmark Performance Summary
+
+| Technique | Parse Rate | Schema Conformity | Field Accuracy | False Fill Rate | Safety Gate | Token Usage | Latency (p50) | Status |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **A-naive** | 17% | 17% | 100% | 0% | **FAIL** | 192 | 420 ms | Rejected |
+| **B-system** | 100% | 67% | 85% | 17% | **FAIL** | 352 | 500 ms | Rejected |
+| **C-fewshot** | 100% | 92% | 92% | 8% | **OK** | 612 | 610 ms | Passed |
+| **D-reasoning** | 100% | 100% | 96% | 8% | **OK** | 462 | 1850 ms | Passed |
+| **E-constrained** | 100% | 100% | 96% | 8% | **OK** | 357 | 540 ms | **Winner** |
+
+*Note: Safety is treated as an absolute gate rather than a weighted score. Any technique with safety violations is automatically disqualified.*
+
+---
+
+## 3. Detailed Technical Analysis & Justification
+
+### A. Disqualification of Failed Techniques (A & B)
+* **A-naive (17% Parse Rate):** Failed fundamental formatting constraints. Without explicit output contracts, the model produced unparseable natural language text.
+* **B-system (Safety Failure):** Generated invalid enum values (e.g., `"intent": "general"`), introduced unexpected keys (`"note"`), omitted required array properties (`evidence_ids`), and violated safety execution boundaries.
+
+### B. Comparative Analysis: C vs. D vs. E
+* **C-fewshot:** Improved structural validity over B, but failed on unprompted edge cases (e.g., defaulting to invalid intent enums on ambiguous inputs).
+* **D-reasoning vs. E-constrained:** Both achieved identical accuracy (96% field correctness, 8% false fill rate) and passed safety checks. However, **Technique E superiorly outperforms Technique D on system efficiency**:
+  * **Latency:** Technique E processes requests in **540 ms** compared to **1850 ms** for D (a ~70% speedup).
+  * **Cost/Tokens:** Technique E consumes **357 tokens/call** versus **462 tokens/call** for D, eliminating the overhead of generating intermediate reasoning text.
+
+---
+
+## 4. Residual Failure Analysis & System Safeguards
+
+### Analysis of Case E11 Failure
+All passing techniques (C, D, and E) failed on test fixture `E11` due to a **Gate 3 violation** (`Unknown order_id: A1102`). The model extracted an order identifier present in the email body that did not correspond to a valid entity in `KNOWN_ORDER_IDS`.
+
+### Production Safeguard Strategy
+Prompt constraints and schema enforcement alone cannot eliminate entity hallucination or cross-referencing errors. Therefore, the production pipeline must enforce **Gate 3 (Database Reference Check)** as a hard downstream programmatic validation step before initiating any automated actions or agent executions.
