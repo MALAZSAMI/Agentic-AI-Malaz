@@ -1,0 +1,260 @@
+"""COSC726 Lab 2 — prompt-engineering portfolio (STUDENT SKELETON).
+
+Task
+----
+One job — triage an inbound support email for Layla — attempted five ways,
+each scored against the same rubric on the same held-out fixtures.
+
+    A  naive              one sentence, no contract
+    B  system prompt      identity, scope, constraints, output contract
+    C  few-shot           B plus worked examples
+    D  reasoning          B plus named intermediate fields
+    E  schema-constrained the schema enforced at generation
+
+Then you write the four validation gates, and finally the decision memo.
+
+Run it:
+    python triage_skeleton.py
+
+Everything is offline. No API key, no network, no cost.
+
+Rules that make the numbers mean something
+------------------------------------------
+1. Change ONE thing per run. If you edit the instruction and the examples
+   together and the score moves, you have learned nothing.
+2. Never put a fixture email in a prompt as an example. That turns the
+   measurement into a lookup. Your examples must be cases you invent.
+3. Never repair the model's output before the gates. Repair hides the defect
+   you are trying to measure.
+4. Report the whole set, not the case that flattered you.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+import lab2_kit as K
+from lab2_kit import Fixture, GateReport
+
+
+# ===========================================================================
+# PART 1 — the five prompts
+# ===========================================================================
+
+# --- A. naive --------------------------------------------------------------
+PROMPT_A = """You are a helpful assistant. Answer the customer's email about
+their order."""
+
+
+# --- B. system prompt ------------------------------------------------------
+PROMPT_B = """You are an automated triage agent for Layla support. Your output is consumed by an automated workflow, NOT by the customer.
+
+SCOPE:
+Classify ONE inbound support email and extract structured fields into a JSON object. Do NOT write a response or reply to the customer.
+
+CONSTRAINTS:
+1. Do not claim any action has been completed without explicit tool execution results in EVIDENCE.
+2. Do not infer or invent any dates, amounts, or values not explicitly present in the email or EVIDENCE.
+3. If a field is not explicitly stated, set its value to null.
+4. A credit/refund can only be proposed/requested, never granted or approved directly.
+5. Do not include markdown code fences (like ```json), commentary, or extra text. Output ONLY the JSON object.
+
+OUTPUT CONTRACT:
+Output exactly one JSON object with the required schema keys. Unknown values must be null.
+"""
+
+
+# --- C. few-shot -----------------------------------------------------------
+PROMPT_C = PROMPT_B + """
+
+EXAMPLES:
+
+Example 1: Missing information -> null values
+Email: "Where is my package? It hasn't arrived yet."
+Evidence: None
+JSON Output:
+{
+  "intent": "shipping_status",
+  "order_id": null,
+  "days_late": null,
+  "proposed_action": null,
+  "evidence_ids": []
+}
+
+Example 2: Compound request with no order ID -> escalate
+Email: "I bought something last week, it was broken when I opened it, and I also want a refund on my subscription!"
+Evidence: []
+JSON Output:
+{
+  "intent": "escalate",
+  "order_id": null,
+  "days_late": null,
+  "proposed_action": "human_review",
+  "evidence_ids": []
+}
+
+Example 3: Late delivery with credit proposal (rare enum value)
+Email: "Order A8821 arrived 5 days late! I want a store credit as compensation."
+Evidence: ["EV-901"]
+JSON Output:
+{
+  "intent": "late_delivery",
+  "order_id": "A8821",
+  "days_late": 5,
+  "proposed_action": "propose_credit",
+  "evidence_ids": ["EV-901"]
+}
+"""
+
+
+# --- D. reasoning ----------------------------------------------------------
+PROMPT_D = PROMPT_B + """
+
+REASONING FIELDS REQUIRED:
+Before deciding the final intent and proposed_action, you must extract:
+- "delay_days_counted": integer representing days late based explicitly on text, or null.
+- "policy_clause_applied": string naming the applicable policy clause (e.g. "LATE_DELIVERY_THRESHOLD", "UNKNOWN"), or null.
+
+Include these intermediate fields in your JSON output alongside the required fields.
+"""
+
+
+# --- E. schema-constrained -------------------------------------------------
+PROMPT_E = PROMPT_B
+
+
+# ===========================================================================
+# PART 2 — the four validation gates
+# ===========================================================================
+
+def gate_1_parses(raw: str) -> dict:
+    """Raw model text -> a dict, or raise."""
+    return json.loads(raw)
+
+
+def gate_2_conforms(data: dict) -> None:
+    """Raise unless `data` validates against K.SCHEMA."""
+    try:
+        import jsonschema
+        jsonschema.validate(instance=data, schema=K.SCHEMA)
+    except ImportError:
+        if not isinstance(data, dict):
+            raise ValueError("Output is not a dictionary")
+        
+        required_fields = {"intent", "order_id", "days_late", "proposed_action", "evidence_ids"}
+        if not required_fields.issubset(data.keys()):
+            raise ValueError(f"Missing required fields: {required_fields - data.keys()}")
+
+        order_id = data.get("order_id")
+        if order_id is not None:
+            if not isinstance(order_id, str) or not re.match(r"^A[0-9]{4}$", order_id):
+                raise ValueError("order_id must match format ^A[0-9]{4}$ or be null")
+
+        days_late = data.get("days_late")
+        if days_late is not None:
+            if not isinstance(days_late, int) or days_late < 0:
+                raise ValueError("days_late must be a non-negative integer or null")
+
+
+def gate_3_refers(data: dict, fx: Fixture) -> None:
+    """Raise unless every ID points at something that actually exists."""
+    order_id = data.get("order_id")
+    if order_id is not None:
+        if order_id not in K.KNOWN_ORDER_IDS:
+            raise ValueError(f"Unknown order_id: {order_id}")
+
+    evidence_ids = data.get("evidence_ids", [])
+    if isinstance(evidence_ids, list):
+        for eid in evidence_ids:
+            if eid not in fx.evidence_ids:
+                raise ValueError(f"Evidence ID {eid} not present in fixture evidence")
+
+
+def gate_4_coheres(data: dict) -> None:
+    """Raise unless the fields agree with each other and with policy."""
+    intent = data.get("intent")
+    days_late = data.get("days_late")
+    proposed_action = data.get("proposed_action")
+    order_id = data.get("order_id")
+
+    if intent == "late_delivery" and order_id is None:
+        raise ValueError("intent 'late_delivery' requires a non-null order_id")
+
+    if proposed_action in ("propose_credit", "approve_credit") or intent == "late_delivery":
+        if proposed_action == "propose_credit" and days_late is None:
+            raise ValueError("Proposing credit for late delivery requires days_late to be specified")
+
+    if days_late is not None and days_late < 3 and proposed_action == "propose_credit":
+        raise ValueError("Late delivery threshold for credit is 3 or more days")
+
+
+def validate_all(raw: str, fx: Fixture) -> GateReport:
+    """Run the four gates, collecting failures instead of raising."""
+    rep = GateReport()
+    try:
+        rep.data = gate_1_parses(raw)
+        rep.parses = True
+    except NotImplementedError:
+        raise
+    except Exception as exc:
+        rep.errors.append(f"gate1: {exc}")
+        return rep
+    for name, fn in (("gate2", lambda: gate_2_conforms(rep.data)),
+                     ("gate3", lambda: gate_3_refers(rep.data, fx)),
+                     ("gate4", lambda: gate_4_coheres(rep.data))):
+        try:
+            fn()
+            setattr(rep, {"gate2": "conforms", "gate3": "refers",
+                          "gate4": "coheres"}[name], True)
+        except NotImplementedError:
+            raise
+        except Exception as exc:
+            rep.errors.append(f"{name}: {exc}")
+    return rep
+
+
+# ===========================================================================
+# PART 3 — run the portfolio
+# ===========================================================================
+
+TECHNIQUES = [
+    ("A-naive", PROMPT_A, None),
+    ("B-system", PROMPT_B, None),
+    ("C-fewshot", PROMPT_C, None),
+    ("D-reasoning", PROMPT_D, None),
+    ("E-constrained", PROMPT_E, K.SCHEMA),
+]
+
+
+def main() -> None:
+    scores = []
+    for name, prompt, schema in TECHNIQUES:
+        if "TODO" in prompt:
+            print(f"[skip] {name}: prompt not written yet")
+            continue
+        client = K.MockModelClient(temperature=0.0)
+        try:
+            scores.append(K.score_technique(
+                name, client, prompt, schema=schema, validator=validate_all))
+        except NotImplementedError as exc:
+            print(f"\n[stop] {exc} is not implemented yet.\n"
+                  "       Write the four gates in Part 2 before scoring —\n"
+                  "       an unimplemented gate would report a fake 0%.")
+            return
+
+    if not scores:
+        print("\nNothing to score yet. Start with PROMPT_B.")
+        return
+
+    print(K.results_table(scores))
+
+    print("\nResidual failures — these are the interesting part:")
+    for s in scores:
+        for f in s.failures[:6]:
+            print(f"  {s.name:<14} {f}")
+
+
+if __name__ == "__main__":
+    main()
+    
